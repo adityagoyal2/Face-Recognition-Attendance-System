@@ -1,6 +1,3 @@
-Below is a **clean, professional, GitHub-ready README.md** you can directly upload.
-It is concise, well-structured, and suitable for public repositories.
-
 ---
 
 ```markdown
