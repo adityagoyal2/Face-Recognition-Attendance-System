@@ -1,6 +1,3 @@
----
-
-```markdown
 # Face Recognition Based Attendance System
 
 A Python-based **Face Recognition Attendance System** that automates attendance marking using computer vision and machine learning. The system detects and recognizes faces in real time through a webcam and records attendance with date and time.
