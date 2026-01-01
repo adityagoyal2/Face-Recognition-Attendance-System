@@ -345,6 +345,8 @@ class FRASApp:
         self.total_students = tk.StringVar(value="0")
         self.present_today = tk.StringVar(value="0")
         self.absent_today = tk.StringVar(value="0")
+        
+        self.authenticated = False  # Session-based auth state
 
         # Pre-load blank image to prevent layout shifts (560x420 is compact 4:3)
         self.blank_img = ImageTk.PhotoImage(Image.new('RGB', (560, 420), color='#020617'))
@@ -353,8 +355,14 @@ class FRASApp:
         self._update_clock()
         self._update_analytics()
         
-        # Delayed greeting to ensure UI is ready
+        # Delayed greeting and periodic refresh
         self.root.after(1000, lambda: self.voice.say("System ready"))
+        self._schedule_analytics_refresh()
+
+    def _schedule_analytics_refresh(self):
+        """Periodically refresh analytics every 30 seconds."""
+        self._update_analytics()
+        self.root.after(30000, self._schedule_analytics_refresh)
 
     def _setup_ui(self):
         # --- Footer (Pack first at bottom) ---
@@ -460,6 +468,13 @@ class FRASApp:
         
         StyledButton(right_col, "VIEW HISTORY", "CARD", self.view_history, highlightbackground=CONFIG["THEME"]["BORDER"], highlightthickness=1).pack(fill="x", pady=2)
         StyledButton(right_col, "MANAGE DATABASE", "CARD", self.manage_students, highlightbackground=CONFIG["THEME"]["BORDER"], highlightthickness=1).pack(fill="x", pady=2)
+        
+        self.lock_btn = StyledButton(right_col, "LOCK SYSTEM", "MUTED", self.lock_system)
+        # Only show if authenticated
+        if not self.authenticated:
+            self.lock_btn.pack_forget()
+        else:
+            self.lock_btn.pack(fill="x", pady=2)
 
         # Progress Box
         progress_box = tk.Frame(right_col, bg=CONFIG["THEME"]["BG"], pady=10)
@@ -485,8 +500,9 @@ class FRASApp:
             f_path = f"{CONFIG['PATHS']['ATTENDANCE']}/Attendance_{date_str}.csv"
             
             present = 0
-            if os.path.exists(f_path):
-                df_at = pd.read_csv(f_path)
+            content = SecurityManager.decrypt_file(f_path)
+            if content:
+                df_at = pd.read_csv(io.StringIO(content))
                 present = len(df_at["ID"].unique())
             
             self.total_students.set(str(total))
@@ -508,10 +524,23 @@ class FRASApp:
         self.status_var.set("Stopping Camera...")
 
     def _check_admin(self):
-        """Blocking call to verify admin."""
+        """Blocking call to verify admin with session support."""
+        if self.authenticated:
+            return True
+            
         auth = AdminAuth(self.root)
         self.root.wait_window(auth)
-        return auth.result
+        if auth.result:
+            self.authenticated = True
+            # Simply pack it at the bottom of its parent (right_col)
+            self.lock_btn.pack(fill="x", pady=2)
+            return True
+        return False
+
+    def lock_system(self):
+        self.authenticated = False
+        self.lock_btn.pack_forget()
+        messagebox.showinfo("Locked", "System Locked Successfully")
 
     def show_frame(self, frame):
         """Displays OpenCV frame in TKinter label."""
@@ -762,7 +791,7 @@ class FRASApp:
 
     def manage_students(self):
         if not self._check_admin(): return
-        StudentManager(self.root, self.data_manager)
+        StudentManager(self, self.data_manager)
 
 # ===================== SECONDARY WINDOWS =====================
 class AttendanceViewer(tk.Toplevel):
@@ -813,11 +842,12 @@ class AttendanceViewer(tk.Toplevel):
                 self.tree.insert("", "end", values=row)
 
 class StudentManager(tk.Toplevel):
-    def __init__(self, parent, data_manager):
-        super().__init__(parent)
+    def __init__(self, app, data_manager):
+        super().__init__(app.root)
         self.title("Manage Student Database")
         self.geometry("850x600")
         self.configure(bg=CONFIG["THEME"]["BG"])
+        self.app = app
         self.dm = data_manager
 
         tree_frame = tk.Frame(self, bg=CONFIG["THEME"]["CARD"])
@@ -838,14 +868,68 @@ class StudentManager(tk.Toplevel):
         btn_frame = tk.Frame(self, bg=CONFIG["THEME"]["BG"], pady=20)
         btn_frame.pack(fill="x", padx=40)
         
-        StyledButton(btn_frame, "DELETE STUDENT", "DANGER", self.delete_student).pack(fill="x")
-        tk.Label(btn_frame, text="* Note: Deleting requires retraining the model.", font=CONFIG["FONTS"]["SMALL"], bg=CONFIG["THEME"]["BG"], fg=CONFIG["THEME"]["MUTED"]).pack(pady=5)
+        StyledButton(btn_frame, "EDIT STUDENT", "INFO", self.edit_student).pack(side="left", expand=True, fill="x", padx=(0, 5))
+        StyledButton(btn_frame, "DELETE STUDENT", "DANGER", self.delete_student).pack(side="left", expand=True, fill="x", padx=(5, 0))
+        
+        tk.Label(self, text="* Note: Editing/Deleting requires retraining the model.", font=CONFIG["FONTS"]["SMALL"], bg=CONFIG["THEME"]["BG"], fg=CONFIG["THEME"]["MUTED"]).pack(pady=5)
 
     def load_students(self):
         for i in self.tree.get_children(): self.tree.delete(i)
         df = self.dm.get_student_details()
         for _, row in df.iterrows():
             self.tree.insert("", "end", values=(row["SERIAL NO."], row["ID"], row["NAME"]))
+
+    def edit_student(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("Selection", "Please select a student to edit.")
+            return
+        
+        item = self.tree.item(selected[0])
+        serial = item['values'][0]
+        old_sid = str(item['values'][1])
+        old_name = item['values'][2]
+        
+        dialog = EditStudentDialog(self, old_sid, old_name)
+        self.wait_window(dialog)
+        
+        if dialog.result:
+            new_sid, new_name = dialog.result
+            
+            # Update Database
+            df = self.dm.get_student_details()
+            
+            # Check if new SID exists (and is not the current one)
+            # Ensure comparison is done between integers
+            new_id_int = int(new_sid)
+            if str(new_sid) != str(old_sid) and new_id_int in df["ID"].astype(int).values:
+                messagebox.showerror("Error", f"ID {new_sid} already exists!")
+                return
+
+            df.loc[df["SERIAL NO."] == int(serial), ["ID", "NAME"]] = [new_id_int, new_name]
+            
+            # Save Encrypted
+            path = CONFIG["PATHS"]["CSV_DETAILS"]
+            csv_str = df.to_csv(index=False)
+            SecurityManager.encrypt_file(path, csv_str)
+            
+            # Rename images
+            img_dir = CONFIG["PATHS"]["TRAIN_IMAGES"]
+            renamed_count = 0
+            for f in os.listdir(img_dir):
+                # Pattern: name.serial.sid.count.jpg
+                parts = f.split('.')
+                if len(parts) == 5 and parts[1] == str(serial):
+                    new_filename = f"{new_name}.{serial}.{new_sid}.{parts[3]}.jpg"
+                    try:
+                        os.rename(os.path.join(img_dir, f), os.path.join(img_dir, new_filename))
+                        renamed_count += 1
+                    except Exception as e:
+                        print(f"Failed to rename {f}: {e}")
+            
+            messagebox.showinfo("Success", f"Updated student details and {renamed_count} images. Please retrain.")
+            self.load_students()
+            self.app._update_analytics()
 
     def delete_student(self):
         selected = self.tree.selection()
@@ -857,7 +941,8 @@ class StudentManager(tk.Toplevel):
         
         if messagebox.askyesno("Confirm", f"Remove {name} (ID: {sid}) and all their images?"):
             df = self.dm.get_student_details()
-            df = df[df["ID"] != sid]
+            # Ensure we compare integers for deletion
+            df = df[df["ID"].astype(int) != int(sid)]
             
             # Save Encrypted
             path = CONFIG["PATHS"]["CSV_DETAILS"]
@@ -873,6 +958,55 @@ class StudentManager(tk.Toplevel):
             
             messagebox.showinfo("Done", "Student data removed. Please retrain model.")
             self.load_students()
+            self.app._update_analytics()
+
+class EditStudentDialog(tk.Toplevel):
+    def __init__(self, parent, old_sid, old_name):
+        super().__init__(parent)
+        self.title("Edit Student Details")
+        self.geometry("400x300")
+        self.configure(bg=CONFIG["THEME"]["CARD"])
+        self.resizable(False, False)
+        self.result = None
+        
+        # Center
+        x = parent.winfo_rootx() + parent.winfo_width()//2 - 200
+        y = parent.winfo_rooty() + parent.winfo_height()//2 - 150
+        self.geometry(f"+{x}+{y}")
+        
+        tk.Label(self, text="EDIT STUDENT", font=CONFIG["FONTS"]["SUBHEADING"], bg=CONFIG["THEME"]["CARD"], fg=CONFIG["THEME"]["ACCENT"]).pack(pady=20)
+        
+        self.id_entry = ModernEntry(self, "Student ID")
+        self.id_entry.pack(fill="x", padx=40, pady=5)
+        self.id_entry.entry.delete(0, tk.END)
+        self.id_entry.entry.insert(0, old_sid)
+        self.id_entry.entry.config(fg=CONFIG["THEME"]["TEXT"])
+        
+        self.name_entry = ModernEntry(self, "Student Name")
+        self.name_entry.pack(fill="x", padx=40, pady=5)
+        self.name_entry.entry.delete(0, tk.END)
+        self.name_entry.entry.insert(0, old_name)
+        self.name_entry.entry.config(fg=CONFIG["THEME"]["TEXT"])
+        
+        btn_frame = tk.Frame(self, bg=CONFIG["THEME"]["CARD"])
+        btn_frame.pack(fill="x", padx=40, pady=20)
+        
+        StyledButton(btn_frame, "CANCEL", "MUTED", self.destroy).pack(side="left", expand=True, fill="x", padx=(0, 5))
+        StyledButton(btn_frame, "SAVE", "ACCENT", self.save).pack(side="left", expand=True, fill="x", padx=(5, 0))
+
+    def save(self):
+        sid = self.id_entry.get().strip()
+        name = self.name_entry.get().strip()
+        
+        if not sid or not name:
+            messagebox.showerror("Error", "All fields required!")
+            return
+        if not sid.isdigit():
+            messagebox.showerror("Error", "ID must be numeric!")
+            return
+            
+        self.result = (sid, name)
+        self.destroy()
 
 if __name__ == "__main__":
     root = tk.Tk()
